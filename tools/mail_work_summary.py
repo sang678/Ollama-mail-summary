@@ -246,9 +246,41 @@ def _clean_html_text(html_content: str) -> str:
     return text.strip()
 
 
+def _extract_date_regex(text: str) -> Optional[datetime]:
+    """텍스트에서 다양한 형식의 날짜(ISO, 한글, 점구분, 8자리숫자)를 정규식으로 안전하게 추출합니다."""
+    if not text:
+        return None
+    
+    # 1. YYYY-MM-DD, YYYY.MM.DD, YYYY/MM/DD
+    m1 = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", text)
+    if m1:
+        try:
+            return datetime(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+        except ValueError:
+            pass
+
+    # 2. YYYY년 MM월 DD일
+    m2 = re.search(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+    if m2:
+        try:
+            return datetime(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+        except ValueError:
+            pass
+
+    # 3. YYYYMMDD (파일명 등 8자리 숫자)
+    m3 = re.search(r"(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])", text)
+    if m3:
+        try:
+            return datetime(int(m3.group(1)), int(m3.group(2)), int(m3.group(3)))
+        except ValueError:
+            pass
+
+    return None
+
+
 def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailItem]:
     """
-    단일 .mht 파일을 읽어 MIME 메시지를 분석하고 표준화된 EmailItem으로 변환합니다.
+    단일 메일 파일(.eml, .mht 등)을 읽어 MIME 메시지를 분석하고 표준화된 EmailItem으로 변환합니다.
     """
     try:
         stat = file_path.stat()
@@ -271,17 +303,48 @@ def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailI
     sender = _decode_mime_header(msg.get("From", "(발신자 없음)"))
     receiver = _decode_mime_header(msg.get("To", "(수신자 없음)"))
 
-    # 일자 파싱 (Date 헤더 우선, 없으면 파일 수정일 사용)
-    date_header = msg.get("Date")
+    # ==============================================================================
+    # 만능 날짜 파싱 (1: 표준 RFC, 2: 정규식/한글 날짜, 3: Received 헤더, 4: 파일명, 5: mtime)
+    # ==============================================================================
     parsed_dt = None
+    date_header = msg.get("Date")
     if date_header:
+        # 1-1. 표준 RFC 파서 시도
         try:
             parsed_dt = parsedate_to_datetime(date_header)
         except Exception:
             pass
-            
+        # 1-2. Date 헤더 문자열에서 정규식 추출
+        if not parsed_dt:
+            parsed_dt = _extract_date_regex(str(date_header))
+
+    # 2. Received 또는 Delivery-date 헤더에서 추출 시도
     if not parsed_dt:
-        # 헤더 파싱 실패 시 파일 생성/수정일로 보수적 대체
+        for alt_header in ("Delivery-date", "Resent-Date", "Received"):
+            h_val = msg.get(alt_header)
+            if h_val:
+                try:
+                    ts = str(h_val).split(";")[-1].strip() if ";" in str(h_val) else str(h_val)
+                    parsed_dt = parsedate_to_datetime(ts)
+                except Exception:
+                    parsed_dt = _extract_date_regex(str(h_val))
+                if parsed_dt:
+                    break
+
+    # 3. 파일명에서 YYYYMMDD 또는 YYYY-MM-DD 추출 시도
+    if not parsed_dt:
+        parsed_dt = _extract_date_regex(file_path.stem)
+
+    # 4. 본문 상단(헤더 영역)에서 날짜 추출 시도
+    if not parsed_dt:
+        try:
+            sample_header_text = raw_bytes[:1500].decode("utf-8", errors="ignore")
+            parsed_dt = _extract_date_regex(sample_header_text)
+        except Exception:
+            pass
+
+    # 5. 최후의 폴백: 파일 수정일(mtime)
+    if not parsed_dt:
         parsed_dt = datetime.fromtimestamp(mtime)
 
     date_str = parsed_dt.strftime("%Y-%m-%d")
@@ -439,14 +502,18 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
     else:
         print(" - ⚠️ 지정된 폴더에 파일이 하나도 없습니다.")
 
+    # 스캔된 파일의 실제 날짜 샘플 출력 (상위 5건)
+    if all_found_dates:
+        print(f" - 📅 파일들에서 감지된 날짜 목록: {', '.join(sorted(list(all_found_dates))[:8])}")
+
     target_desc = "전체 일자(all)" if is_all_dates else target_date
     print(f"[1] 메일 파싱 완료: 총 {total_scanned}개 파일 스캔(허용 확장자: {','.join(extensions)}) 중 대상일({target_desc}) {date_matched}건 추출")
     
     if total_scanned > 0 and date_matched == 0 and not is_all_dates:
         dates_preview = ", ".join(sorted(list(all_found_dates))[:5])
         print(f" ⚠️ [알림] 파일은 {total_scanned}개 발견되었으나, 대상일({target_date})과 일치하지 않아 0건 추출되었습니다.")
-        print(f"    👉 발견된 파일들의 실제 날짜 예시: {dates_preview}")
-        print("    👉 전체 날짜를 정리하려면 --target-date all 옵션을 사용하세요.")
+        print(f"    👉 감지된 메일 날짜 중 하나로 실행하려면: python tools/mail_work_summary.py --target-date {list(all_found_dates)[0]} --no-llm")
+        print("    👉 날짜 제한 없이 전부 정리하려면: python tools/mail_work_summary.py --target-date all --no-llm")
 
     return {
         "parsed_items": parsed_items,
