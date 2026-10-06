@@ -280,135 +280,174 @@ def _extract_date_regex(text: str) -> Optional[datetime]:
 
 def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailItem]:
     """
-    단일 메일 파일(.eml, .mht 등)을 읽어 MIME 메시지를 분석하고 표준화된 EmailItem으로 변환합니다.
+    단일 메일 파일(.eml, .mht 등)을 읽어 분석합니다.
+    [원칙] 파싱 중 어떤 에러가 발생하더라도 절대 파일을 버리지 않고, 
+    텍스트 복원 모드로 살려내어 '확인 필요(UNCERTAIN)'로 보존합니다 (누락 원천 차단).
     """
     try:
         stat = file_path.stat()
         mtime = stat.st_mtime
     except Exception:
-        return None
+        mtime = datetime.now().timestamp()
 
+    raw_bytes = b""
     try:
         with open(file_path, "rb") as f:
             raw_bytes = f.read()
-        
-        # email 모듈의 기본 정책으로 메시지 로드
-        msg = email.message_from_bytes(raw_bytes, policy=policy.default)
     except Exception as e:
-        print(f"[파싱 실패] {file_path.name}: {e}")
+        print(f"[파일 읽기 실패] {file_path.name}: {e}")
         return None
 
-    # 헤더 추출 및 디코딩
-    subject = _decode_mime_header(msg.get("Subject", "(제목 없음)"))
-    sender = _decode_mime_header(msg.get("From", "(발신자 없음)"))
-    receiver = _decode_mime_header(msg.get("To", "(수신자 없음)"))
+    # 1차 시도: 표준 MIME 파싱
+    try:
+        msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+        subject = _decode_mime_header(msg.get("Subject", ""))
+        sender = _decode_mime_header(msg.get("From", ""))
+        receiver = _decode_mime_header(msg.get("To", ""))
 
-    # ==============================================================================
-    # 만능 날짜 파싱 (1: 표준 RFC, 2: 정규식/한글 날짜, 3: Received 헤더, 4: 파일명, 5: mtime)
-    # ==============================================================================
-    parsed_dt = None
-    date_header = msg.get("Date")
-    if date_header:
-        # 1-1. 표준 RFC 파서 시도
-        try:
-            parsed_dt = parsedate_to_datetime(date_header)
-        except Exception:
-            pass
-        # 1-2. Date 헤더 문자열에서 정규식 추출
-        if not parsed_dt:
-            parsed_dt = _extract_date_regex(str(date_header))
-
-    # 2. Received 또는 Delivery-date 헤더에서 추출 시도
-    if not parsed_dt:
-        for alt_header in ("Delivery-date", "Resent-Date", "Received"):
-            h_val = msg.get(alt_header)
-            if h_val:
-                try:
-                    ts = str(h_val).split(";")[-1].strip() if ";" in str(h_val) else str(h_val)
-                    parsed_dt = parsedate_to_datetime(ts)
-                except Exception:
-                    parsed_dt = _extract_date_regex(str(h_val))
-                if parsed_dt:
-                    break
-
-    # 3. 파일명에서 YYYYMMDD 또는 YYYY-MM-DD 추출 시도
-    if not parsed_dt:
-        parsed_dt = _extract_date_regex(file_path.stem)
-
-    # 4. 본문 상단(헤더 영역)에서 날짜 추출 시도
-    if not parsed_dt:
-        try:
-            sample_header_text = raw_bytes[:1500].decode("utf-8", errors="ignore")
-            parsed_dt = _extract_date_regex(sample_header_text)
-        except Exception:
-            pass
-
-    # 5. 최후의 폴백: 파일 수정일(mtime)
-    if not parsed_dt:
-        parsed_dt = datetime.fromtimestamp(mtime)
-
-    date_str = parsed_dt.strftime("%Y-%m-%d")
-    mail_date = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    # 본문 텍스트 추출 (multipart 순회)
-    body_text = ""
-    html_fallback = ""
-
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disp = str(part.get("Content-Disposition", ""))
-            if "attachment" in content_disp:
-                continue
-
+        # 날짜 파싱
+        parsed_dt = None
+        date_header = msg.get("Date")
+        if date_header:
             try:
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                charset = part.get_content_charset() or "utf-8"
-                decoded_str = payload.decode(charset, errors="replace")
+                parsed_dt = parsedate_to_datetime(date_header)
+            except Exception:
+                pass
+            if not parsed_dt:
+                parsed_dt = _extract_date_regex(str(date_header))
 
-                if content_type == "text/plain" and not body_text:
-                    body_text = decoded_str
-                elif content_type == "text/html" and not html_fallback:
+        if not parsed_dt:
+            for alt_header in ("Delivery-date", "Resent-Date", "Received"):
+                h_val = msg.get(alt_header)
+                if h_val:
+                    try:
+                        ts = str(h_val).split(";")[-1].strip() if ";" in str(h_val) else str(h_val)
+                        parsed_dt = parsedate_to_datetime(ts)
+                    except Exception:
+                        parsed_dt = _extract_date_regex(str(h_val))
+                    if parsed_dt:
+                        break
+
+        if not parsed_dt:
+            parsed_dt = _extract_date_regex(file_path.stem)
+
+        if not parsed_dt:
+            try:
+                sample_header_text = raw_bytes[:1500].decode("utf-8", errors="ignore")
+                parsed_dt = _extract_date_regex(sample_header_text)
+            except Exception:
+                pass
+
+        if not parsed_dt:
+            parsed_dt = datetime.fromtimestamp(mtime)
+
+        date_str = parsed_dt.strftime("%Y-%m-%d")
+        mail_date = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 본문 텍스트 추출 (multipart 순회)
+        body_text = ""
+        html_fallback = ""
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                content_disp = str(part.get("Content-Disposition", ""))
+                if "attachment" in content_disp:
+                    continue
+
+                try:
+                    payload = part.get_payload(decode=True)
+                    if not payload:
+                        continue
+                    charset = part.get_content_charset() or "utf-8"
+                    decoded_str = payload.decode(charset, errors="replace")
+
+                    if content_type == "text/plain" and not body_text:
+                        body_text = decoded_str
+                    elif content_type == "text/html" and not html_fallback:
+                        html_fallback = decoded_str
+                except Exception:
+                    continue
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                decoded_str = payload.decode(charset, errors="replace")
+                if msg.get_content_type() == "text/html":
                     html_fallback = decoded_str
+                else:
+                    body_text = decoded_str
+
+        final_body = body_text if body_text else _clean_html_text(html_fallback)
+        final_body_clean = final_body[:1500].strip()
+
+        # 만약 본문이 비어있다면 원문 텍스트 복원 시도
+        if not final_body_clean:
+            for enc in ("utf-8", "cp949", "euc-kr", "latin1"):
+                try:
+                    final_body_clean = _clean_html_text(raw_bytes[:3000].decode(enc, errors="ignore"))
+                    break
+                except Exception:
+                    pass
+
+        # 제목이 비어있다면 파일명으로 대체
+        if not subject or subject == "(제목 없음)":
+            subject = file_path.stem
+
+        is_my_sent = (MY_EMAIL.lower() in sender.lower()) or (folder_type == "SENT")
+
+        return {
+            "id": file_path.name,
+            "file_path": str(file_path),
+            "folder_type": folder_type,
+            "subject": subject,
+            "sender": sender or "발신자 미상",
+            "receiver": receiver or "수신자 미상",
+            "mail_date": mail_date,
+            "date_str": date_str,
+            "body_clean": final_body_clean,
+            "is_my_sent": is_my_sent,
+            "status": "PENDING_LLM",
+            "category": "OTHER",
+            "decided_by": "static",
+            "rule_name": "mime_parsed",
+            "evidence": "표준 MIME 파싱 성공",
+        }
+
+    except Exception as mime_err:
+        # [Fail-Safe] 표준 파싱 실패 시 텍스트 복원 모드로 구제 (절대 버리지 않음)
+        print(f"⚠️ [파싱 경고] {file_path.name} MIME 파싱 오류 ({mime_err}) -> 텍스트 복원 모드로 안전 보존합니다.")
+        recovered_text = ""
+        for enc in ("utf-8", "cp949", "euc-kr", "latin1"):
+            try:
+                recovered_text = raw_bytes[:3000].decode(enc, errors="ignore")
+                break
             except Exception:
                 continue
-    else:
-        # 단일 파트 메시지
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            decoded_str = payload.decode(charset, errors="replace")
-            if msg.get_content_type() == "text/html":
-                html_fallback = decoded_str
-            else:
-                body_text = decoded_str
 
-    final_body = body_text if body_text else _clean_html_text(html_fallback)
-    # LLM 토큰 절약 및 메모리 보호를 위해 최대 1500자로 제한
-    final_body_clean = final_body[:1500].strip()
+        # 텍스트 내에서 제목/날짜 간이 추출
+        subj_match = re.search(r"(?:Subject|제목)\s*[:：]\s*(.+)", recovered_text, re.IGNORECASE)
+        fallback_subject = subj_match.group(1).strip() if subj_match else file_path.stem
 
-    # 본인 발신 여부 판정 (MY_EMAIL 기준)
-    is_my_sent = (MY_EMAIL.lower() in sender.lower()) or (folder_type == "SENT")
+        fallback_dt = _extract_date_regex(recovered_text) or _extract_date_regex(file_path.stem) or datetime.fromtimestamp(mtime)
 
-    return {
-        "id": file_path.name,
-        "file_path": str(file_path),
-        "folder_type": folder_type,
-        "subject": subject,
-        "sender": sender,
-        "receiver": receiver,
-        "mail_date": mail_date,
-        "date_str": date_str,
-        "body_clean": final_body_clean,
-        "is_my_sent": is_my_sent,
-        "status": "PENDING_LLM",
-        "category": "OTHER",
-        "decided_by": "static",
-        "rule_name": "initial_parse",
-        "evidence": "초기 파싱 완료",
-    }
+        return {
+            "id": file_path.name,
+            "file_path": str(file_path),
+            "folder_type": folder_type,
+            "subject": fallback_subject[:100],
+            "sender": "파싱 복원 (헤더 손상)",
+            "receiver": "파싱 복원 (헤더 손상)",
+            "mail_date": fallback_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "date_str": fallback_dt.strftime("%Y-%m-%d"),
+            "body_clean": _clean_html_text(recovered_text[:1000]),
+            "is_my_sent": folder_type == "SENT",
+            "status": "UNCERTAIN",
+            "category": "UNCERTAIN_ITEM",
+            "decided_by": "fallback",
+            "rule_name": "failsafe_recovery",
+            "evidence": f"파싱 오류({mime_err}) 발생으로 텍스트 복원 후 확인 필요 보존",
+        }
 
 
 # ==============================================================================
