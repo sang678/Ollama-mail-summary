@@ -357,7 +357,8 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
     [1단계 노드] 지정된 수신/발신 폴더의 .mht 파일을 스캔하고 파싱합니다.
     캐시를 활용하여 이미 파싱된 파일은 디스크 I/O를 생략합니다.
     """
-    target_date = state["target_date"]
+    target_date = state.get("target_date", "").strip()
+    is_all_dates = target_date.lower() in ("all", "*", "")
     inbox_dir = Path(state["inbox_dir"])
     sent_dir = Path(state["sent_dir"])
     extensions = state.get("extensions") or MAIL_EXTENSIONS
@@ -365,7 +366,7 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
     # 확장자 목록 정규화 (점 포함, 소문자)
     active_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions if e}
     allow_no_ext = ("" in extensions) or ("no_ext" in extensions)
-    allow_all = "*" in extensions
+    allow_all = ("*" in extensions) or ("all" in extensions)
 
     cache = _load_parsing_cache()
     new_cache = dict(cache)
@@ -377,11 +378,19 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
         (sent_dir, "SENT"),
     ]
 
+    print("\n[📁 경로 진단]")
+    for p, label in scan_targets:
+        exists_str = "존재함 (O)" if p.exists() else "❌ 존재하지 않음 (X)"
+        print(f" - [{label}] 경로: {p.resolve()} -> {exists_str}")
+
     total_scanned = 0
     date_matched = 0
+    all_found_dates = set()
+    found_ext_stats: Dict[str, int] = {}
 
     for folder_path, folder_type in scan_targets:
         if not folder_path.exists():
+            print(f"[경고] {folder_type} 폴더가 디스크에 존재하지 않습니다: {folder_path.resolve()}")
             continue
 
         # 대소문자 및 하위 폴더까지 중복 없이 안전하게 탐색
@@ -390,7 +399,10 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
             for file_path in folder_path.rglob("*"):
                 if not file_path.is_file():
                     continue
+                
                 suffix = file_path.suffix.lower()
+                found_ext_stats[suffix] = found_ext_stats.get(suffix, 0) + 1
+
                 if allow_all or (suffix in active_exts) or (not suffix and allow_no_ext):
                     scanned_files.add(file_path.resolve())
         except Exception as e:
@@ -413,14 +425,28 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
                     new_cache[cache_key] = item
 
             if item:
-                # 대상 일자가 지정된 경우 일치 여부 확인
-                if not target_date or item["date_str"] == target_date:
+                all_found_dates.add(item["date_str"])
+                # 대상 일자가 all이거나 지정일과 일치하는 경우
+                if is_all_dates or item["date_str"] == target_date:
                     parsed_items.append(item)
                     date_matched += 1
 
     _save_parsing_cache(new_cache)
 
-    print(f"[1] 메일 파싱 완료: 총 {total_scanned}개 파일 스캔(확장자: {','.join(extensions)}) 중 대상일({target_date or '전체'}) {date_matched}건 추출")
+    if found_ext_stats:
+        ext_summary = ", ".join([f"'{k or '(확장자없음)'}': {v}개" for k, v in found_ext_stats.items()])
+        print(f" - 폴더 내 실제 파일 확장자 분포: {ext_summary}")
+    else:
+        print(" - ⚠️ 지정된 폴더에 파일이 하나도 없습니다.")
+
+    target_desc = "전체 일자(all)" if is_all_dates else target_date
+    print(f"[1] 메일 파싱 완료: 총 {total_scanned}개 파일 스캔(허용 확장자: {','.join(extensions)}) 중 대상일({target_desc}) {date_matched}건 추출")
+    
+    if total_scanned > 0 and date_matched == 0 and not is_all_dates:
+        dates_preview = ", ".join(sorted(list(all_found_dates))[:5])
+        print(f" ⚠️ [알림] 파일은 {total_scanned}개 발견되었으나, 대상일({target_date})과 일치하지 않아 0건 추출되었습니다.")
+        print(f"    👉 발견된 파일들의 실제 날짜 예시: {dates_preview}")
+        print("    👉 전체 날짜를 정리하려면 --target-date all 옵션을 사용하세요.")
 
     return {
         "parsed_items": parsed_items,
@@ -634,7 +660,8 @@ def node_aggregate_and_report(state: DailyWorkState) -> dict:
     [4단계 노드] 분류 결과를 집계하고 구조화된 Markdown 보고서를 생성합니다.
     소형 LLM의 서식 붕괴를 막기 위해 보고서 뼈대 및 섹션 분류는 코드로 100% 결정적으로 조립합니다.
     """
-    target_date = state["target_date"] or datetime.now().strftime("%Y-%m-%d")
+    raw_date = state.get("target_date", "")
+    target_date = "전체 기간(All)" if raw_date.lower() in ("all", "*") else (raw_date or datetime.now().strftime("%Y-%m-%d"))
     items = state["parsed_items"]
     stats = state.get("rule_stats", {})
 
@@ -778,7 +805,14 @@ def run_mail_work_summary(
     Returns:
         dict: {"summary": dict, "items": list, "report": str}
     """
-    effective_date = target_date.strip() if target_date else date.today().strftime("%Y-%m-%d")
+    raw_target = target_date.strip()
+    if raw_target.lower() in ("all", "*"):
+        effective_date = "all"
+    elif raw_target:
+        effective_date = raw_target
+    else:
+        effective_date = date.today().strftime("%Y-%m-%d")
+
     effective_inbox = inbox_dir.strip() if inbox_dir else MAIL_INBOX_DIR
     effective_sent = sent_dir.strip() if sent_dir else MAIL_SENT_DIR
     effective_email = my_email.strip() if my_email else MY_EMAIL
