@@ -512,6 +512,23 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
 
         for file_path in sorted(scanned_files):
             total_scanned += 1
+            if total_scanned == 1:
+                print(f"\n[🔍 첫 번째 파일 정밀 진단: {file_path.name}]")
+                try:
+                    with open(file_path, "rb") as test_f:
+                        head_bytes = test_f.read(250)
+                    print(f" - 파일 크기: {file_path.stat().st_size} bytes")
+                    if head_bytes.startswith(b'\xd0\xcf\x11\xe0'):
+                        print(" - ⚠️ 파일 형태: 아웃룩 2016 복합 바이너리(.msg/CFBF) 형식 감지됨!")
+                    else:
+                        print(" - 파일 시작 150바이트 (미리보기):")
+                        try:
+                            print("   " + head_bytes[:150].decode('utf-8', errors='replace').replace('\n', ' '))
+                        except Exception:
+                            print("   " + repr(head_bytes[:150]))
+                except Exception as test_err:
+                    print(f" - 파일 읽기 오류: {test_err}")
+
             try:
                 mtime = file_path.stat().st_mtime
                 cache_key = f"{file_path}_{mtime}"
@@ -532,6 +549,8 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
                 if is_all_dates or item["date_str"] == target_date:
                     parsed_items.append(item)
                     date_matched += 1
+            else:
+                print(f" - ⚠️ [{file_path.name}] 파싱 실패(None 반환)로 제외됨")
 
     _save_parsing_cache(new_cache)
 
