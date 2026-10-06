@@ -51,13 +51,18 @@ JUDGE_MODEL = "gemma4:e2b"
 MY_EMAIL = "developer@company.com"
 MAIL_INBOX_DIR = r"C:\mail_archive\inbox"
 MAIL_SENT_DIR = r"C:\mail_archive\sent"
+MAIL_EXTENSIONS = [".eml", ".mht", ".mhtml", ".txt", ".mail"]  # 대상 확장자 설정 (자유롭게 추가/변경 가능)
 ```
 
 ### 3. CLI 단독 실행 테스트
 
 #### (1) 규칙 기반 단독 실행 (Ollama 불필요)
 ```bash
+# 기본 설정된 확장자로 실행
 python tools/mail_work_summary.py --target-date 2026-10-06 --no-llm
+
+# 특정 확장자만 지정하여 실행 (예: .eml)
+python tools/mail_work_summary.py --target-date 2026-10-06 --extensions .eml --no-llm
 ```
 
 #### (2) 소형 LLM 연동 실행

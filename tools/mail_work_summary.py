@@ -63,6 +63,7 @@ try:
         MAIL_INBOX_DIR,
         MAIL_SENT_DIR,
         CACHE_DIR,
+        MAIL_EXTENSIONS,
     )
 except ImportError:
     # 단독 환경 또는 config 부재 시 폴백 설정 (운영 환경에서는 config.py 필수)
@@ -73,6 +74,7 @@ except ImportError:
     MAIL_INBOX_DIR = str(PACKAGE_ROOT / "sample_mails" / "inbox")
     MAIL_SENT_DIR = str(PACKAGE_ROOT / "sample_mails" / "sent")
     CACHE_DIR = str(PACKAGE_ROOT / ".cache")
+    MAIL_EXTENSIONS = [".eml", ".mht", ".mhtml", ".txt", ".mail"]
 
 try:
     from tools import register
@@ -125,6 +127,7 @@ class DailyWorkState(TypedDict):
     target_date: str                # 대상 일자 (YYYY-MM-DD)
     inbox_dir: str                  # 수신 메일 폴더 경로
     sent_dir: str                   # 발신 메일 폴더 경로
+    extensions: List[str]           # 스캔 대상 메일 확장자 목록
     my_email: str                   # 작성자 이메일
     use_llm: bool                   # LLM 활성화 여부
     detail_level: str               # full | summary | minimal
@@ -357,6 +360,12 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
     target_date = state["target_date"]
     inbox_dir = Path(state["inbox_dir"])
     sent_dir = Path(state["sent_dir"])
+    extensions = state.get("extensions") or MAIL_EXTENSIONS
+
+    # 확장자 목록 정규화 (점 포함, 소문자)
+    active_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions if e}
+    allow_no_ext = ("" in extensions) or ("no_ext" in extensions)
+    allow_all = "*" in extensions
 
     cache = _load_parsing_cache()
     new_cache = dict(cache)
@@ -375,11 +384,17 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
         if not folder_path.exists():
             continue
 
-        # 윈도우 파일시스템 특성(대소문자 미구분)으로 인한 중복 탐색 방지
+        # 대소문자 및 하위 폴더까지 중복 없이 안전하게 탐색
         scanned_files = set()
-        for ext in ("*.mht", "*.mhtml"):
-            for file_path in folder_path.glob(ext):
-                scanned_files.add(file_path.resolve())
+        try:
+            for file_path in folder_path.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                suffix = file_path.suffix.lower()
+                if allow_all or (suffix in active_exts) or (not suffix and allow_no_ext):
+                    scanned_files.add(file_path.resolve())
+        except Exception as e:
+            print(f"[경고] 폴더 스캔 중 오류 ({folder_path}): {e}")
 
         for file_path in sorted(scanned_files):
             total_scanned += 1
@@ -405,7 +420,7 @@ def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
 
     _save_parsing_cache(new_cache)
 
-    print(f"[1] 메일 파싱 완료: 총 {total_scanned}개 파일 스캔 중 대상일({target_date or '전체'}) {date_matched}건 추출")
+    print(f"[1] 메일 파싱 완료: 총 {total_scanned}개 파일 스캔(확장자: {','.join(extensions)}) 중 대상일({target_date or '전체'}) {date_matched}건 추출")
 
     return {
         "parsed_items": parsed_items,
@@ -744,6 +759,7 @@ def run_mail_work_summary(
     inbox_dir: str = "",
     sent_dir: str = "",
     my_email: str = "",
+    extensions: Optional[List[str]] = None,
     use_llm: bool = True,
     detail: str = "full"
 ) -> dict:
@@ -752,9 +768,10 @@ def run_mail_work_summary(
 
     Args:
         target_date: 대상 일자 (YYYY-MM-DD, 비어있으면 오늘 날짜)
-        inbox_dir: 수신 메일 폴더 (.mht)
-        sent_dir: 발신 메일 폴더 (.mht)
+        inbox_dir: 수신 메일 폴더 (.eml, .mht 등)
+        sent_dir: 발신 메일 폴더 (.eml, .mht 등)
         my_email: 사용자 본인 식별 이메일 주소
+        extensions: 탐색할 메일 확장자 리스트 (기본값: config.py의 MAIL_EXTENSIONS)
         use_llm: LLM 정밀 판정 사용 여부
         detail: 출력 상세 수준 (full, summary, minimal)
 
@@ -765,11 +782,13 @@ def run_mail_work_summary(
     effective_inbox = inbox_dir.strip() if inbox_dir else MAIL_INBOX_DIR
     effective_sent = sent_dir.strip() if sent_dir else MAIL_SENT_DIR
     effective_email = my_email.strip() if my_email else MY_EMAIL
+    effective_exts = extensions if extensions is not None else MAIL_EXTENSIONS
 
     initial_state: DailyWorkState = {
         "target_date": effective_date,
         "inbox_dir": effective_inbox,
         "sent_dir": effective_sent,
+        "extensions": effective_exts,
         "my_email": effective_email,
         "use_llm": use_llm,
         "detail_level": detail,
@@ -794,7 +813,7 @@ def run_mail_work_summary(
 # [원칙] 소형 모델이 여러 도구를 오판하여 호출하지 않도록 에이전트에는 이 단일 도구만 노출합니다.
 @tool
 def summarize_daily_work_mail(target_date: str = "") -> str:
-    """수신/발신 메일 원문(.mht)을 분석하여 특정 일자의 업무 내역 일지(발신 보고, 수신 요청 등)를 마크다운 리포트로 생성합니다.
+    """수신/발신 메일 원문(.eml, .mht 등)을 분석하여 특정 일자의 업무 내역 일지(발신 보고, 수신 요청 등)를 마크다운 리포트로 생성합니다.
 
     Args:
         target_date: 정리할 대상 일자 (YYYY-MM-DD 형식, 예: '2026-10-06'). 비어있으면 오늘 날짜를 기준으로 합니다.
@@ -812,7 +831,7 @@ register(
     label="일일 메일 업무 정리",
     view="markdown",
     detail_endpoint="/api/tools/mail-work-summary/detail",
-    hint="메일 원문(.mht)을 기반으로 일별 업무 수행 내역을 취합할 때 사용하세요. target_date는 YYYY-MM-DD 형식입니다."
+    hint="메일 원문(.eml, .mht)을 기반으로 일별 업무 수행 내역을 취합할 때 사용하세요. target_date는 YYYY-MM-DD 형식입니다."
 )
 
 
@@ -822,7 +841,7 @@ register(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="수신/발신 .mht 메일 파싱 기반 일일 업무 정리 LangGraph 도구"
+        description="수신/발신 메일 원문(.eml, .mht 등) 파싱 기반 일일 업무 정리 LangGraph 도구"
     )
     parser.add_argument(
         "--target-date",
@@ -834,13 +853,19 @@ if __name__ == "__main__":
         "--inbox-dir",
         type=str,
         default="",
-        help="수신 메일 폴더 경로 (.mht)",
+        help="수신 메일 폴더 경로 (.eml, .mht 등)",
     )
     parser.add_argument(
         "--sent-dir",
         type=str,
         default="",
-        help="발신 메일 폴더 경로 (.mht)",
+        help="발신 메일 폴더 경로 (.eml, .mht 등)",
+    )
+    parser.add_argument(
+        "--extensions",
+        type=str,
+        default="",
+        help="스캔 대상 메일 확장자 (콤마 구분, 예: .eml,.mht,.txt)",
     )
     parser.add_argument(
         "--my-email",
@@ -878,11 +903,14 @@ if __name__ == "__main__":
     print(f" - LLM 사용: {not args.no_llm}")
     print("=================================================================")
 
+    ext_list = [e.strip() for e in args.extensions.split(",") if e.strip()] if args.extensions else None
+
     output = run_mail_work_summary(
         target_date=args.target_date,
         inbox_dir=args.inbox_dir,
         sent_dir=args.sent_dir,
         my_email=args.my_email,
+        extensions=ext_list,
         use_llm=not args.no_llm,
         detail=args.detail,
     )

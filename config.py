@@ -17,11 +17,14 @@ USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
 # 사용자 식별용 이메일 (발신/수신 식별 및 업무 분류용)
 MY_EMAIL = os.getenv("MY_EMAIL", "developer@company.com")
 
-# 메일 아카이브 (.mht 파일) 기본 경로 설정
-# 기본값은 로컬 테스트용 sample_mails 경로
+# 메일 아카이브 파일 경로 및 대상 확장자 설정
 DEFAULT_DATA_DIR = BASE_DIR / "sample_mails"
 MAIL_INBOX_DIR = os.getenv("MAIL_INBOX_DIR", str(DEFAULT_DATA_DIR / "inbox"))
 MAIL_SENT_DIR = os.getenv("MAIL_SENT_DIR", str(DEFAULT_DATA_DIR / "sent"))
+
+# 스캔 대상 메일 파일 확장자 (콤마 구분 환경변수 지원, 기본값: .eml, .mht, .mhtml, .txt, .mail)
+_raw_exts = os.getenv("MAIL_EXTENSIONS", ".eml,.mht,.mhtml,.txt,.mail")
+MAIL_EXTENSIONS = [ext.strip().lower() for ext in _raw_exts.split(",") if ext.strip()]
 
 # 캐시 저장 경로
 CACHE_DIR = os.getenv("CACHE_DIR", str(BASE_DIR / ".cache"))
