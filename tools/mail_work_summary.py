@@ -65,8 +65,9 @@ try:
         CACHE_DIR,
         MAIL_EXTENSIONS,
     )
-except ImportError:
-    # 단독 환경 또는 config 부재 시 폴백 설정 (운영 환경에서는 config.py 필수)
+except ImportError as err:
+    # config.py를 못 찾거나 임포트 실패 시 상세 원인 출력 (조용한 실패 방지)
+    print(f"⚠️ [주의] config.py 임포트 실패 ({err}). 기본 sample_mails 폴백 설정을 사용합니다.")
     OLLAMA_HOST = "http://localhost:11434"
     JUDGE_MODEL = "gemma4:e2b"
     USE_LLM = True
