@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# 메일 원문 파일 및 개인 데이터 (보안)
+*.mht
+*.mhtml
+*.eml
+*.msg
+sample_mails/
+.cache/
+
+# 환경 설정 및 민감 정보
+.env
+.env.local
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
