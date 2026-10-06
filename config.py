@@ -18,16 +18,18 @@ USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
 MY_EMAIL = os.getenv("MY_EMAIL", "developer@company.com")
 
 # ==============================================================================
-# 메일 아카이브 파일 경로 설정 (★ 여기에 실제 폴더 경로를 입력하세요)
-# 경로 앞에 r을 붙여야 윈도우 역슬래시(\) 오류가 발생하지 않습니다.
+# 메일 아카이브 실제 폴더 경로 설정 (★ 여기에 실제 폴더 경로를 입력하세요)
+# 윈도우 역슬래시(\) 오류 방지를 위해 경로 앞에 r을 붙여주세요.
+# 예: MAIL_INBOX_DIR = r"C:\Users\username\Desktop\Mail\Inbox"
 # ==============================================================================
-# 실제 경로를 바로 지정할 때:
-MAIL_INBOX_DIR = os.getenv("MAIL_INBOX_DIR") or str(BASE_DIR / "sample_mails" / "inbox")
-MAIL_SENT_DIR = os.getenv("MAIL_SENT_DIR") or str(BASE_DIR / "sample_mails" / "sent")
+MAIL_INBOX_DIR = str(BASE_DIR / "sample_mails" / "inbox")
+MAIL_SENT_DIR = str(BASE_DIR / "sample_mails" / "sent")
 
-# ※ 다른 PC에서 테스트 시 아래 주석을 풀고 실제 경로를 직접 지정하실 수도 있습니다:
-# MAIL_INBOX_DIR = r"C:\실제\수신메일\폴더경로"
-# MAIL_SENT_DIR = r"C:\실제\발신메일\폴더경로"
+# (선택) 시스템 환경 변수가 설정되어 있으면 환경 변수 값으로 우선 덮어씀
+if os.getenv("MAIL_INBOX_DIR"):
+    MAIL_INBOX_DIR = os.getenv("MAIL_INBOX_DIR")
+if os.getenv("MAIL_SENT_DIR"):
+    MAIL_SENT_DIR = os.getenv("MAIL_SENT_DIR")
 
 # 스캔 대상 메일 파일 확장자 (콤마 구분 환경변수 지원, 기본값: .eml, .mht, .mhtml, .txt, .mail)
 _raw_exts = os.getenv("MAIL_EXTENSIONS", ".eml,.mht,.mhtml,.txt,.mail")

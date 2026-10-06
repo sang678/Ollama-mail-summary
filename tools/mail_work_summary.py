@@ -52,19 +52,18 @@ PACKAGE_ROOT = CURRENT_DIR.parent
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-# 설정 및 레지스트리 임포트
-# [원칙] 도구 파일 내부에서 os.getenv를 직접 호출하지 않고 config.py를 단일 진실 공급원으로 사용합니다.
+CONFIG_FILE_PATH = "기본 fallback 설정 (config.py 미연결)"
 try:
-    from config import (
-        OLLAMA_HOST,
-        JUDGE_MODEL,
-        USE_LLM,
-        MY_EMAIL,
-        MAIL_INBOX_DIR,
-        MAIL_SENT_DIR,
-        CACHE_DIR,
-        MAIL_EXTENSIONS,
-    )
+    import config
+    CONFIG_FILE_PATH = str(getattr(config, "__file__", "config.py"))
+    OLLAMA_HOST = getattr(config, "OLLAMA_HOST", "http://localhost:11434")
+    JUDGE_MODEL = getattr(config, "JUDGE_MODEL", "gemma4:e2b")
+    USE_LLM = getattr(config, "USE_LLM", True)
+    MY_EMAIL = getattr(config, "MY_EMAIL", "developer@company.com")
+    MAIL_INBOX_DIR = getattr(config, "MAIL_INBOX_DIR", str(PACKAGE_ROOT / "sample_mails" / "inbox"))
+    MAIL_SENT_DIR = getattr(config, "MAIL_SENT_DIR", str(PACKAGE_ROOT / "sample_mails" / "sent"))
+    CACHE_DIR = getattr(config, "CACHE_DIR", str(PACKAGE_ROOT / ".cache"))
+    MAIL_EXTENSIONS = getattr(config, "MAIL_EXTENSIONS", [".eml", ".mht", ".mhtml", ".txt", ".mail"])
 except ImportError as err:
     # config.py를 못 찾거나 임포트 실패 시 상세 원인 출력 (조용한 실패 방지)
     print(f"⚠️ [주의] config.py 임포트 실패 ({err}). 기본 sample_mails 폴백 설정을 사용합니다.")
@@ -934,6 +933,7 @@ if __name__ == "__main__":
 
     print("=================================================================")
     print(" [일일 메일 업무 정리 LangGraph 에이전트 CLI 실행]")
+    print(f" - 설정 파일 출처: {CONFIG_FILE_PATH}")
     print(f" - 기준 일자: {args.target_date or date.today().strftime('%Y-%m-%d')}")
     print(f" - LLM 사용: {not args.no_llm}")
     print("=================================================================")
