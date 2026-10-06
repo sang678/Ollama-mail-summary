@@ -450,20 +450,113 @@ def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailI
         }
 
 
+import subprocess
+
+def _run_java_parser(
+    inbox_dir: Path,
+    sent_dir: Path,
+    target_date: str,
+    my_email: str,
+    extensions: List[str]
+) -> Optional[List[EmailItem]]:
+    """
+    Java MailParser.java를 호출하여 고속/무결 파싱을 수행합니다.
+    Java가 없거나 실패 시 None을 반환하여 Python 내장 파서로 안전하게 폴백합니다.
+    """
+    java_file = CURRENT_DIR / "MailParser.java"
+    if not java_file.exists():
+        return None
+
+    # 임시 출력 파일 생성
+    cache_path = Path(CACHE_DIR)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    temp_output = cache_path / f"java_parsed_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.json"
+
+    cmd = [
+        "java",
+        str(java_file),
+        "--inbox", str(inbox_dir),
+        "--sent", str(sent_dir),
+        "--target-date", target_date or "all",
+        "--my-email", my_email,
+        "--extensions", ",".join(extensions),
+        "--output", str(temp_output)
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=60)
+        if temp_output.exists() and temp_output.stat().st_size > 0:
+            with open(temp_output, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            temp_output.unlink(missing_ok=True)
+
+            items: List[EmailItem] = []
+            for d in data:
+                items.append({
+                    "id": str(d.get("id", "")),
+                    "file_path": str(d.get("file_path", "")),
+                    "folder_type": str(d.get("folder_type", "INBOX")),
+                    "subject": str(d.get("subject", "")),
+                    "sender": str(d.get("sender", "")),
+                    "receiver": str(d.get("receiver", "")),
+                    "mail_date": str(d.get("mail_date", "")),
+                    "date_str": str(d.get("date_str", "")),
+                    "body_clean": str(d.get("body_clean", "")),
+                    "is_my_sent": bool(d.get("is_my_sent", False)),
+                    "status": "PENDING_LLM",
+                    "category": "OTHER",
+                    "decided_by": "static",
+                    "rule_name": "java_parsed",
+                    "evidence": "Java SE 고속 파싱 성공",
+                })
+            return items
+    except Exception as e:
+        print(f"[Java 파서 안내] Java 실행 건너뜀 ({e}), Python 내장 파서로 전환합니다.")
+    finally:
+        if temp_output.exists():
+            temp_output.unlink(missing_ok=True)
+
+    return None
+
+
 # ==============================================================================
 # 4. LangGraph 파이프라인 노드 정의
 # ==============================================================================
 
 def node_scan_and_parse_mht(state: DailyWorkState) -> dict:
     """
-    [1단계 노드] 지정된 수신/발신 폴더의 .mht 파일을 스캔하고 파싱합니다.
-    캐시를 활용하여 이미 파싱된 파일은 디스크 I/O를 생략합니다.
+    [1단계 노드] 지정된 수신/발신 폴더의 메일 파일을 스캔하고 파싱합니다.
+    Java MailParser가 존재하면 1순위로 고속 파싱을 수행하고, 부재 시 Python 파서로 폴백합니다.
     """
     target_date = state.get("target_date", "").strip()
     is_all_dates = target_date.lower() in ("all", "*", "")
     inbox_dir = Path(state["inbox_dir"])
     sent_dir = Path(state["sent_dir"])
     extensions = state.get("extensions") or MAIL_EXTENSIONS
+
+    # [1순위] Java 고속 파서 우선 실행
+    java_items = _run_java_parser(
+        inbox_dir=inbox_dir,
+        sent_dir=sent_dir,
+        target_date=target_date,
+        my_email=state.get("my_email", MY_EMAIL),
+        extensions=extensions
+    )
+    if java_items is not None:
+        target_desc = "전체 일자(all)" if is_all_dates else (target_date or "전체")
+        print(f"[1] ★ Java 고속 파서 실행 성공: 총 {len(java_items)}건 메일 수집 완료 (대상일: {target_desc})")
+        return {
+            "parsed_items": java_items,
+            "rule_stats": {
+                "total_parsed": len(java_items),
+                "rule_excluded": 0,
+                "rule_included": 0,
+                "llm_evaluated": 0,
+                "uncertain_fallback": 0,
+            }
+        }
+
+    # [2순위 폴백] Python 내장 파서 실행
 
     # 확장자 목록 정규화 (점 포함, 소문자)
     active_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions if e}

@@ -6,17 +6,18 @@
 
 ## 🌟 주요 특징 및 설계 원칙
 
-1. **규칙 우선 및 LLM 최소 호출 (Cost & Token Efficiency)**:
+1. **Java 고속 파서 + Python LangGraph 하이브리드 구조**:
+   - 사내 폐쇄망 환경에서 인코딩/메일 포맷 이슈를 완벽하게 해결하기 위해 **순수 Java SE 기반 메일 파서(`MailParser.java`)**를 1순위로 연동합니다.
+   - 외부 라이브러리(Maven/Gradle) 전혀 없이 JDK 11+ 내장 API만으로 단일 실행되며, Java가 없는 환경에서는 Python 내장 파서로 자동 폴백(Fallback)합니다.
+2. **규칙 우선 및 LLM 최소 호출 (Cost & Token Efficiency)**:
    - 결정적인 수집, 파싱, 시스템 알림/식단표 제외, 명확한 업무 키워드 매칭은 **100% 코드로 처리**합니다.
    - 규칙으로 판단할 수 없는 모호한 메일만 **소형 LLM(gemma4:e2b)**에 구조화 출력(`with_structured_output`, `json_schema`)으로 1회 질의합니다.
-2. **보수적 누락 방지 (Conservative Fallback)**:
+3. **보수적 누락 방지 (Conservative Fallback)**:
    - LLM 오류, 네트워크 지연, 미판정 메일은 절대 버리지 않고 `UNCERTAIN`("확인 필요")으로 안전하게 보존합니다.
-3. **판정 근거 보존**:
+4. **판정 근거 보존**:
    - 모든 메일에 판정 주체(`decided_by`: static | rule | llm | fallback), 규칙명(`rule_name`), 판단 근거(`evidence`)를 함께 기록합니다.
-4. **수신 / 발신 폴더 분리 및 본인 식별**:
+5. **수신 / 발신 폴더 분리 및 본인 식별**:
    - 수신(`inbox`), 발신(`sent`) 폴더 스캔 및 본인 이메일(`MY_EMAIL`) 대조를 통해 "주요 발신/수행 업무"와 "수신 협업/요청"을 정확히 분류합니다.
-5. **독립 단일 파일 구조**:
-   - 기존 사내 챗봇에 `@tool`로 즉시 연결 가능하며, CLI 단독 실행(`--no-llm`, `--target-date`)도 완벽히 지원합니다.
 
 ---
 
@@ -24,12 +25,13 @@
 
 ```
 impact_chat/
-├── config.py                 # 공통 환경 설정 (Ollama 호스트, 모델, MY_EMAIL 등)
+├── config.py                 # 공통 환경 설정 (Ollama 호스트, 모델, 폴더 경로 등)
 ├── requirements.txt          # 최소 의존성 패키지 명세
 ├── .gitignore                # 민감 정보 및 대용량 캐시 제외
 ├── README.md                 # 프로젝트 문서
 └── tools/
     ├── __init__.py           # 챗봇 도구 레지스트리 (register)
+    ├── MailParser.java       # ★ 순수 Java 고속 메일 파서 (외부 의존성 제로)
     └── mail_work_summary.py  # ★ 메일 파싱 및 일일 업무 정리 LangGraph 단일 파일
 ```
 
