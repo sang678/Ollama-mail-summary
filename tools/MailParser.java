@@ -194,10 +194,10 @@ public class MailParser {
         String dateStr = mailDateTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
         String mailDate = mailDateTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
-        // 본문 텍스트 정제
+        // 본문 텍스트 정제 (스마트 스레드 맥락 추출을 위해 최대 8000자까지 보존)
         String cleanBody = extractCleanBody(bodySection, headers);
-        if (cleanBody.length() > 1500) {
-            cleanBody = cleanBody.substring(0, 1500);
+        if (cleanBody.length() > 8000) {
+            cleanBody = cleanBody.substring(0, 8000);
         }
 
         boolean isMySent = sender.toLowerCase().contains(myEmail.toLowerCase()) || "SENT".equalsIgnoreCase(folderType);

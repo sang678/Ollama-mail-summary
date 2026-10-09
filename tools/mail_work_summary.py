@@ -113,7 +113,7 @@ class EmailItem(TypedDict):
     receiver: str           # 수신자
     mail_date: str          # 메일 발송/수신 일시 (YYYY-MM-DD HH:MM:SS)
     date_str: str           # 비교용 일자 (YYYY-MM-DD)
-    body_clean: str         # 정제된 텍스트 본문 (최대 1500자)
+    body_clean: str         # 정제된 텍스트 본문 (스마트 스레드 맥락 반영, 최대 약 3000자)
     is_my_sent: bool        # 본인 발신 여부 (MY_EMAIL 기준)
     status: str             # INCLUDED (업무 포함) | EXCLUDED (제외) | UNCERTAIN (확인 필요) | PENDING_LLM (판정 대기)
     category: str           # MY_REPORT (내 발신/보고) | RECEIVED_REQUEST (수신 협업/요청) | UNCERTAIN_ITEM (확인 필요) | EXCLUDED_ITEM (제외)
@@ -244,6 +244,104 @@ def _clean_html_text(html_content: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
+
+
+def _clean_disclaimer_and_signatures(text: str) -> str:
+    """
+    메일 본문 내 사내 보안 고지문, 면책 조항(Disclaimer), 시스템 공통 문구, 반복 서명 등을 제거합니다.
+    """
+    if not text:
+        return ""
+    
+    # 1. 일반적인 사내 면책/보안 고지문 패턴 절단
+    disclaimer_patterns = [
+        r"(?i)\n\s*(?:본\s*메일은\s*(?:지정된|수신자|업무상).*|※\s*본\s*메일은\s*발신전용.*)",
+        r"(?i)\n\s*(?:This\s+e-?mail\s+(?:and\s+any\s+attachments|is\s+intended).*|This\s+message\s+contains\s+confidential.*)",
+        r"(?i)\n\s*(?:개인정보\s*보호법에\s*따라.*|무단\s*(?:전재|복제|배포)를\s*금합니다.*)",
+    ]
+    for pattern in disclaimer_patterns:
+        m = re.search(pattern, text)
+        if m:
+            text = text[:m.start()].strip()
+
+    # 2. 표준 이메일 서명 구분선 (-- ) 이하 제거
+    sig_m = re.search(r"(?m)^\s*--\s*$", text)
+    if sig_m:
+        text = text[:sig_m.start()].strip()
+
+    return text.strip()
+
+
+# 이메일 스레드 인용 구분자 정규식 (Outlook, Apple, Webmail, Thunderbird 등)
+_THREAD_SPLIT_REGEX = re.compile(
+    r"(?m)^[ \t]*(?:"
+    r"-{3,}[^-]+?-{3,}[ \t]*\n?"
+    r"|_{8,}[ \t]*$"
+    r"|={8,}[ \t]*$"
+    r"|(?:From|보낸\s*사람)[ \t]*[:：].+?(?:\n[ \t]+.+?)*\n[ \t]*(?:Sent|Date|보낸\s*날짜|날짜)[ \t]*[:：].+?"
+    r"|On[ \t].+?,[ \t].+?[ \t]wrote:"
+    r"|\d{4}년[ \t]*\d{1,2}월[ \t]*\d{1,2}일[ \t]*.+?작성:"
+    r")",
+    re.IGNORECASE
+)
+
+# 인용 블록 상단에 잔존하는 이메일 헤더 라인 제거 정규식
+_HEADER_CLEAN_REGEX = re.compile(
+    r"^(?:[ \t]*(?:"
+    r"(?:From|보낸\s*사람|Sent|Date|보낸\s*날짜|날짜|To|받는\s*사람|Subject|제목|Cc|참조)[ \t]*[:：].*?"
+    r"|\d{4}[-./]\d{1,2}[-./]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
+    r")\s*\n)+",
+    re.IGNORECASE | re.MULTILINE
+)
+
+
+def _extract_smart_thread_context(raw_text: str) -> str:
+    """
+    스마트 스레드 추출기:
+    메일이 20~30개씩 누적된 긴 스레드라도 토큰 폭발을 방지하면서 핵심 맥락을 완벽 보존합니다.
+    - [최신 회신 내용] (이번 조치/답변)
+    - [직전 요청 맥락] (상대방의 직접적인 요청/사유)
+    - [최초 스레드 원문] (스레드가 시작된 최초의 목적/프로젝트 주제)
+    중간에 낀 반복 회신은 과감하게 생략하여 일정한 길이(약 2,500~3,000자 이내)로 압축합니다.
+    """
+    if not raw_text:
+        return ""
+
+    raw_cleaned = _clean_disclaimer_and_signatures(raw_text)
+
+    # 스레드 구분자를 기준으로 분할
+    raw_chunks = _THREAD_SPLIT_REGEX.split(raw_cleaned)
+    
+    meaningful_segments: List[str] = []
+    for c in raw_chunks:
+        # 상단 잔존 헤더 메타데이터 제거 및 서명 정리
+        cleaned_c = _clean_disclaimer_and_signatures(_HEADER_CLEAN_REGEX.sub("", c).strip())
+        if len(cleaned_c) > 10:
+            meaningful_segments.append(cleaned_c)
+
+    if not meaningful_segments:
+        return raw_cleaned[:3000].strip()
+
+    if len(meaningful_segments) == 1:
+        return meaningful_segments[0][:3000].strip()
+
+    if len(meaningful_segments) == 2:
+        latest = meaningful_segments[0][:1500].strip()
+        previous = meaningful_segments[1][:1500].strip()
+        return f"[최신 회신 내용]\n{latest}\n\n[직전 메일 맥락]\n{previous}".strip()
+
+    # 3개 이상인 경우 (예: 20개 누적 스레드)
+    latest = meaningful_segments[0][:1200].strip()
+    previous = meaningful_segments[1][:1000].strip()
+    origin = meaningful_segments[-1][:800].strip()
+    omitted_count = len(meaningful_segments) - 2
+
+    return (
+        f"[최신 회신 내용]\n{latest}\n\n"
+        f"[직전 요청 맥락]\n{previous}\n\n"
+        f"(※ 중간 {omitted_count}개의 이전 회신 내역 생략됨)\n\n"
+        f"[최초 스레드 원문]\n{origin}"
+    ).strip()
 
 
 def _extract_date_regex(text: str) -> Optional[datetime]:
@@ -378,15 +476,21 @@ def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailI
                 else:
                     body_text = decoded_str
 
-        final_body = body_text if body_text else _clean_html_text(html_fallback)
-        final_body_clean = final_body[:1500].strip()
+        # 본문 텍스트 추출 시 항상 HTML 정제 필터를 통과시키고 스마트 스레드 맥락을 추출
+        clean_text_part = _clean_html_text(body_text) if body_text else ""
+        clean_html_part = _clean_html_text(html_fallback) if html_fallback else ""
+        raw_final_body = clean_text_part if clean_text_part else clean_html_part
+
+        final_body_clean = _extract_smart_thread_context(raw_final_body)
 
         # 만약 본문이 비어있다면 원문 텍스트 복원 시도
         if not final_body_clean:
             for enc in ("utf-8", "cp949", "euc-kr", "latin1"):
                 try:
-                    final_body_clean = _clean_html_text(raw_bytes[:3000].decode(enc, errors="ignore"))
-                    break
+                    recovered = _clean_html_text(raw_bytes[:8000].decode(enc, errors="ignore"))
+                    final_body_clean = _extract_smart_thread_context(recovered)
+                    if final_body_clean:
+                        break
                 except Exception:
                     pass
 
@@ -420,7 +524,7 @@ def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailI
         recovered_text = ""
         for enc in ("utf-8", "cp949", "euc-kr", "latin1"):
             try:
-                recovered_text = raw_bytes[:3000].decode(enc, errors="ignore")
+                recovered_text = raw_bytes[:8000].decode(enc, errors="ignore")
                 break
             except Exception:
                 continue
@@ -440,7 +544,7 @@ def _parse_single_mht_file(file_path: Path, folder_type: str) -> Optional[EmailI
             "receiver": "파싱 복원 (헤더 손상)",
             "mail_date": fallback_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "date_str": fallback_dt.strftime("%Y-%m-%d"),
-            "body_clean": _clean_html_text(recovered_text[:1000]),
+            "body_clean": _extract_smart_thread_context(_clean_html_text(recovered_text)),
             "is_my_sent": folder_type == "SENT",
             "status": "UNCERTAIN",
             "category": "UNCERTAIN_ITEM",
@@ -501,7 +605,7 @@ def _run_java_parser(
                     "receiver": str(d.get("receiver", "")),
                     "mail_date": str(d.get("mail_date", "")),
                     "date_str": str(d.get("date_str", "")),
-                    "body_clean": str(d.get("body_clean", "")),
+                    "body_clean": _extract_smart_thread_context(str(d.get("body_clean", ""))),
                     "is_my_sent": bool(d.get("is_my_sent", False)),
                     "status": "PENDING_LLM",
                     "category": "OTHER",
@@ -683,6 +787,7 @@ def node_rule_filter(state: DailyWorkState) -> dict:
     [2단계 노드] 정적 조건 및 정규식 규칙으로 명확한 대상을 먼저 선별합니다.
     LLM을 호출하지 않고 코드로 결정적 처리를 하여 비용과 환각을 원천 차단합니다.
     """
+    use_llm = state.get("use_llm", USE_LLM)
     items = state["parsed_items"]
     updated_items: List[EmailItem] = []
     stats = dict(state.get("rule_stats", {}))
@@ -737,8 +842,8 @@ def node_rule_filter(state: DailyWorkState) -> dict:
             updated_items.append(item)
             continue
 
-        # 규칙 3: 명확한 업무 키워드 매칭
-        work_match = work_keyword_re.search(subject) or work_keyword_re.search(body[:300])
+        # 규칙 3: 명확한 업무 키워드 매칭 (스마트 스레드 전체 맥락 고려 1500자 검사)
+        work_match = work_keyword_re.search(subject) or work_keyword_re.search(body[:1500])
         if work_match:
             item["status"] = "INCLUDED"
             item["decided_by"] = "rule"
@@ -755,12 +860,21 @@ def node_rule_filter(state: DailyWorkState) -> dict:
             updated_items.append(item)
             continue
 
-        # 규칙에 걸리지 않은 애매한 메일은 LLM 판정 대기로 유지
-        item["status"] = "PENDING_LLM"
-        item["decided_by"] = "fallback"
-        item["rule_name"] = "rule_unmatched"
-        item["evidence"] = "정적 규칙 미매칭으로 LLM 판정 대기"
-        updated_items.append(item)
+        # 규칙 미매칭 건: 사용자 요구사항에 따라 기본 포맷 2번(기타 문의 및 업무 대응)으로 편입
+        if not use_llm:
+            item["status"] = "INCLUDED"
+            item["decided_by"] = "rule"
+            item["rule_name"] = "unmatched_inquiry_default"
+            item["evidence"] = "규칙 미매칭 일반 문의 기본 배정"
+            item["category"] = "MY_REPORT" if (item["is_my_sent"] or item["folder_type"] == "SENT") else "RECEIVED_REQUEST"
+            stats["rule_included"] = stats.get("rule_included", 0) + 1
+            updated_items.append(item)
+        else:
+            item["status"] = "PENDING_LLM"
+            item["decided_by"] = "fallback"
+            item["rule_name"] = "rule_unmatched"
+            item["evidence"] = "정적 규칙 미매칭으로 LLM 판정 대기"
+            updated_items.append(item)
 
     pending_count = sum(1 for x in updated_items if x["status"] == "PENDING_LLM")
     print(f"[2] 규칙 필터링 완료: 업무 확정 {stats.get('rule_included', 0)}건, 제외 {stats.get('rule_excluded', 0)}건, LLM 판정 대상 {pending_count}건")
@@ -774,9 +888,8 @@ def node_rule_filter(state: DailyWorkState) -> dict:
 def node_llm_classify(state: DailyWorkState) -> dict:
     """
     [3단계 노드] 규칙으로 풀지 못한 모호한 메일만 소형 LLM(gemma4:e2b)으로 판정합니다.
-    - 단일 질문 + json_schema 스키마 강제
-    - 대상 줄 `>>>` 마커 표시
-    - 실패 시 누락 방지를 위해 UNCERTAIN(확인 필요) 배정
+    - 실제 업무면 INCLUDED, 명백한 스팸/비업무면 EXCLUDED
+    - 실패 또는 애매한 경우 사용자 기본 포맷 원칙에 따라 '기타 문의 및 업무 대응(INCLUDED)'으로 배정
     """
     use_llm = state.get("use_llm", USE_LLM)
     items = state["parsed_items"]
@@ -787,16 +900,16 @@ def node_llm_classify(state: DailyWorkState) -> dict:
         print("[3] LLM 판정 단계: 판정 대상 메일이 없어 건너뜁니다.")
         return {"parsed_items": items, "rule_stats": stats}
 
-    # LLM 미사용 모드이거나 폐쇄망에서 LLM 비활성화 시 보수적 폴백 처리
+    # LLM 미사용 모드 시 모두 기본 '기타 문의 대응'으로 즉시 편입
     if not use_llm:
-        print(f"[3] LLM 비활성화(--no-llm) 모드: 모호한 메일 {len(pending_indices)}건을 '확인 필요(UNCERTAIN)'로 배정합니다.")
+        print(f"[3] LLM 비활성화(--no-llm) 모드: 모호한 메일 {len(pending_indices)}건을 '기타 문의 대응'으로 기본 배정합니다.")
         for idx in pending_indices:
-            items[idx]["status"] = "UNCERTAIN"
-            items[idx]["category"] = "UNCERTAIN_ITEM"
-            items[idx]["decided_by"] = "fallback"
-            items[idx]["rule_name"] = "no_llm_conservative_fallback"
-            items[idx]["evidence"] = "LLM 미사용으로 인한 보수적 확인 필요 배정"
-            stats["uncertain_fallback"] = stats.get("uncertain_fallback", 0) + 1
+            items[idx]["status"] = "INCLUDED"
+            items[idx]["category"] = "MY_REPORT" if items[idx]["is_my_sent"] else "RECEIVED_REQUEST"
+            items[idx]["decided_by"] = "rule"
+            items[idx]["rule_name"] = "unmatched_inquiry_default"
+            items[idx]["evidence"] = "규칙 미매칭 일반 문의 기본 배정"
+            stats["rule_included"] = stats.get("rule_included", 0) + 1
         return {"parsed_items": items, "rule_stats": stats}
 
     # ChatOllama 소형 모델 초기화 (규격 필수 인자 준수)
@@ -812,33 +925,35 @@ def node_llm_classify(state: DailyWorkState) -> dict:
         # tool calling 대신 안정적인 스키마 강제 디코딩
         structured_llm = base_llm.with_structured_output(WorkJudgement, method="json_schema")
     except Exception as e:
-        print(f"[경고] ChatOllama 초기화 실패 ({e}). 모호한 항목을 모두 '확인 필요'로 전환합니다.")
+        print(f"[경고] ChatOllama 초기화 실패 ({e}). 모호한 항목을 기본 '기타 문의 대응'으로 배정합니다.")
         for idx in pending_indices:
-            items[idx]["status"] = "UNCERTAIN"
-            items[idx]["category"] = "UNCERTAIN_ITEM"
+            items[idx]["status"] = "INCLUDED"
+            items[idx]["category"] = "MY_REPORT" if items[idx]["is_my_sent"] else "RECEIVED_REQUEST"
             items[idx]["decided_by"] = "fallback"
-            items[idx]["rule_name"] = "ollama_init_failure"
-            items[idx]["evidence"] = f"LLM 연결 실패로 인한 보수적 배정 ({e})"
-            stats["uncertain_fallback"] = stats.get("uncertain_fallback", 0) + 1
+            items[idx]["rule_name"] = "unmatched_inquiry_default"
+            items[idx]["evidence"] = f"LLM 연결 실패로 인한 일반 문의 기본 배정 ({e})"
+            stats["rule_included"] = stats.get("rule_included", 0) + 1
         return {"parsed_items": items, "rule_stats": stats}
 
     print(f"[3] LLM 판정 시작: {len(pending_indices)}건의 애매한 메일을 {JUDGE_MODEL} 모델로 판정합니다.")
 
     for idx in pending_indices:
         item = items[idx]
-        snippet = item["body_clean"][:400].replace("\n", " ").strip()
+        thread_context = item["body_clean"][:2500].strip()
 
-        # 프롬프트 구성: 한 프롬프트에 질문 하나, 짧고 명확한 규칙, >>> 마커 활용
+        # 프롬프트 구성
         prompt = f"""당신은 사내 이메일이 실제 업무와 관련된 것인지 판정하는 어시스턴트입니다.
 규칙:
 1. 실제 프로젝트, 시스템 개발, 업무 협의, 일정 조율, 업무 요청이면 is_work_related=true
 2. 사적인 대화, 단순 안부 인사, 외부 스팸성 홍보 메일이면 is_work_related=false
-3. 애매하면 누락 방지를 위해 true로 판정하세요.
+3. 회신 메일의 경우 본문 하단의 이전 메일 맥락(직전 요청, 최초 원문)을 함께 참고하여 종합 판정하세요.
+4. 애매하면 누락 방지를 위해 true로 판정하세요.
 
 판정 대상 메일:
 >>> 제목: {item['subject']}
 >>> 발신자: {item['sender']}
->>> 본문 내용: {snippet}
+>>> 본문 및 스레드 맥락:
+{thread_context}
 """
         try:
             result: WorkJudgement = structured_llm.invoke(prompt)
@@ -857,15 +972,15 @@ def node_llm_classify(state: DailyWorkState) -> dict:
                 item["rule_name"] = f"llm_{JUDGE_MODEL}"
                 item["evidence"] = result.reason or "LLM 비업무 판정"
         except Exception as e:
-            # LLM 호출 실패 시 조용히 넘기지 않고 보수적으로 '확인 필요' 표시
-            item["status"] = "UNCERTAIN"
-            item["category"] = "UNCERTAIN_ITEM"
+            # LLM 호출 실패 시 기본 기타 문의 대응으로 편입
+            item["status"] = "INCLUDED"
+            item["category"] = "MY_REPORT" if item["is_my_sent"] else "RECEIVED_REQUEST"
             item["decided_by"] = "fallback"
-            item["rule_name"] = "llm_invoke_error"
-            item["evidence"] = f"LLM 판정 오류 발생 ({e}), 확인 필요 배정"
-            stats["uncertain_fallback"] = stats.get("uncertain_fallback", 0) + 1
+            item["rule_name"] = "unmatched_inquiry_default"
+            item["evidence"] = f"LLM 판정 예외 발생({e}) -> 일반 문의 기본 배정"
+            stats["rule_included"] = stats.get("rule_included", 0) + 1
 
-    print(f"[3] LLM 판정 완료: 성공 {stats.get('llm_evaluated', 0)}건, 폴백(확인필요) {stats.get('uncertain_fallback', 0)}건")
+    print(f"[3] LLM 판정 완료: 성공 {stats.get('llm_evaluated', 0)}건")
 
     return {
         "parsed_items": items,
@@ -873,99 +988,192 @@ def node_llm_classify(state: DailyWorkState) -> dict:
     }
 
 
+# ==============================================================================
+# 4. 리포트 생성 헬퍼 및 기본 포맷팅 유틸리티
+# ==============================================================================
+
+def _is_meeting_mail(item: EmailItem) -> bool:
+    """메일이 회의록 또는 회의 내용 관련인지 판별합니다."""
+    subject = item.get("subject", "")
+    body = item.get("body_clean", "")
+    meeting_pattern = re.compile(
+        r"회의록|회의\s*내용|미팅록|미팅\s*내용|주간\s*회의|정기\s*회의|일일\s*스탠드업|"
+        r"회의\s*(?:공유|안내|결과|정리)|미팅\s*(?:공유|안내|결과|정리)|싱크\s*(?:미팅|회의)|\bMeeting\b|\bSync\b",
+        re.IGNORECASE
+    )
+    return bool(meeting_pattern.search(subject) or meeting_pattern.search(body[:500]))
+
+
+def _extract_meeting_details(item: EmailItem) -> Dict[str, str]:
+    """
+    [기본 포맷 1: 회의록 및 회의 내용]
+    - 참여자: 본문 내 '참석자/참여자' 또는 발신/수신자 정보
+    - 회의시간: 본문 내 '일시/시간' 또는 메일 발신 일시
+    - 회의내용 요약: 안건 및 핵심 결정사항 요약
+    """
+    body = item.get("body_clean", "")
+    sender = item.get("sender", "발신자 미상")
+    receiver = item.get("receiver", "수신자 미상")
+    mail_date = item.get("mail_date", "")
+
+    # 1. 참여자 추출
+    p_match = re.search(r"(?:참석자|참여자|참석|참여|Attended|Attendees)\s*[:：]\s*(.+)", body)
+    if p_match:
+        participants = p_match.group(1).strip()
+    else:
+        participants = f"{sender} (발신), {receiver} (수신)"
+
+    # 2. 회의시간 추출
+    t_match = re.search(r"(?:회의\s*일시|미팅\s*일시|일시|시간|일정)\s*[:：]\s*(.+)", body)
+    if t_match:
+        meeting_time = t_match.group(1).strip()
+    else:
+        meeting_time = mail_date
+
+    # 3. 회의내용 요약
+    clean_summary = body
+    clean_summary = re.sub(r"\[최신 회신 내용\]|\[직전 요청 맥락\]|\[최초 스레드 원문\]", "", clean_summary)
+    clean_summary = clean_summary.replace("\r\n", " ").replace("\n", " ").strip()
+    clean_summary = re.sub(r"[ \t]+", " ", clean_summary)
+    meeting_summary = clean_summary[:350].strip()
+    if not meeting_summary:
+        meeting_summary = item.get("evidence", "회의 내용 공유 및 검토")
+
+    return {
+        "participants": participants,
+        "meeting_time": meeting_time,
+        "meeting_summary": meeting_summary,
+    }
+
+
+def _clean_subject_title(subject: str) -> str:
+    """메일 제목에서 불필요한 접두어를 정돈하여 깔끔한 업무 제목을 선정합니다."""
+    if not subject:
+        return "업무 문의 및 요청 건"
+    cleaned = subject
+    cleaned = re.sub(r"^\[(?:검토\s*요청|보고|진행\s*현황|공지|요청|안내|문의|협조)\]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:Re|Fwd|FW|답변|전달)\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+    return cleaned if cleaned else subject.strip()
+
+
+def _extract_inquiry_details(item: EmailItem) -> Dict[str, str]:
+    """
+    [기본 포맷 2: 기타 문의 대응]
+    - 요청자: 발신자 (본인 발신 회신의 경우 수신처/의뢰처)
+    - 내용 제목 선정: 원제목을 정제한 핵심 업무 제목
+    - 내용 요약: 요청 사항 및 조치/대응 결과 요약
+    """
+    body = item.get("body_clean", "")
+    sender = item.get("sender", "발신자 미상")
+    receiver = item.get("receiver", "수신자 미상")
+    subject = item.get("subject", "")
+
+    # 1. 요청자 선정
+    if item.get("is_my_sent") or item.get("folder_type") == "SENT":
+        requester = f"{receiver} (수신/의뢰처)"
+    else:
+        requester = sender
+
+    # 2. 내용 제목 선정
+    selected_title = _clean_subject_title(subject)
+
+    # 3. 내용 요약
+    clean_summary = body.replace("\n", " ").strip()
+    content_summary = clean_summary[:350].strip()
+    if not content_summary:
+        content_summary = item.get("evidence", "업무 요청 및 문의 대응")
+
+    return {
+        "requester": requester,
+        "selected_title": selected_title,
+        "content_summary": content_summary,
+    }
+
+
 def node_aggregate_and_report(state: DailyWorkState) -> dict:
     """
     [4단계 노드] 분류 결과를 집계하고 구조화된 Markdown 보고서를 생성합니다.
-    소형 LLM의 서식 붕괴를 막기 위해 보고서 뼈대 및 섹션 분류는 코드로 100% 결정적으로 조립합니다.
+    사용자 지정 기본 포맷(옵션 A):
+    1. 회의록 및 회의 내용 (참여자, 회의시간, 회의내용 요약)
+    2. 기타 문의 대응 (요청자, 내용 제목 선정, 내용 요약)
     """
     raw_date = state.get("target_date", "")
     target_date = "전체 기간(All)" if raw_date.lower() in ("all", "*") else (raw_date or datetime.now().strftime("%Y-%m-%d"))
     items = state["parsed_items"]
     stats = state.get("rule_stats", {})
 
-    my_reports = [x for x in items if x["status"] == "INCLUDED" and x["category"] == "MY_REPORT"]
-    received_requests = [x for x in items if x["status"] == "INCLUDED" and x["category"] == "RECEIVED_REQUEST"]
-    uncertain_items = [x for x in items if x["status"] == "UNCERTAIN"]
+    included_items = [x for x in items if x["status"] != "EXCLUDED"]
+    meeting_items = [x for x in included_items if _is_meeting_mail(x)]
+    inquiry_items = [x for x in included_items if not _is_meeting_mail(x)]
     excluded_items = [x for x in items if x["status"] == "EXCLUDED"]
 
     # 1. 요약 통계 딕셔너리 생성
     summary = {
         "target_date": target_date,
         "total_emails": len(items),
-        "included_work_count": len(my_reports) + len(received_requests),
-        "my_reports_count": len(my_reports),
-        "received_requests_count": len(received_requests),
-        "uncertain_count": len(uncertain_items),
+        "included_work_count": len(included_items),
+        "meeting_items_count": len(meeting_items),
+        "inquiry_items_count": len(inquiry_items),
         "excluded_count": len(excluded_items),
         "rule_stats": stats,
     }
 
-    # 2. Markdown 리포트 조립
+    # 2. Markdown 리포트 조립 (옵션 A)
     lines = []
     lines.append(f"# 📅 일일 업무 내역 정리 ({target_date})")
     lines.append("")
     lines.append("## 📊 업무 처리 요약")
     lines.append(f"- **전체 분석 메일**: {len(items)}건")
-    lines.append(f"- **업무 내역 반영**: {len(my_reports) + len(received_requests)}건 (발신 보고 {len(my_reports)}건 / 수신 요청 {len(received_requests)}건)")
-    lines.append(f"- **확인 필요(모호/오류)**: {len(uncertain_items)}건")
+    lines.append(f"- **업무 내역 반영**: {len(included_items)}건 (회의록 {len(meeting_items)}건 / 문의 및 업무 대응 {len(inquiry_items)}건)")
     lines.append(f"- **제외 메일**: {len(excluded_items)}건")
     lines.append("")
 
     # 핵심 요약 불릿
-    lines.append("## 1. 오늘 주요 업무 핵심 요약")
-    if not my_reports and not received_requests:
+    lines.append("## 📌 오늘 주요 업무 요약")
+    if not included_items:
         lines.append("- 해당 일자에 추출된 업무 메일이 없습니다.")
     else:
-        for item in my_reports:
-            lines.append(f"- **[발신]** {item['subject']} (근거: {item['evidence']})")
-        for item in received_requests:
-            lines.append(f"- **[수신]** {item['subject']} (발신: {item['sender']}, 근거: {item['evidence']})")
+        for item in meeting_items:
+            m_info = _extract_meeting_details(item)
+            lines.append(f"- **[회의]** {item['subject']} (시간: {m_info['meeting_time']})")
+        for item in inquiry_items:
+            i_info = _extract_inquiry_details(item)
+            lines.append(f"- **[문의/대응]** {i_info['selected_title']} (요청: {i_info['requester']})")
     lines.append("")
 
-    # 주요 발신 및 수행 업무
-    lines.append("## 2. 주요 발신 및 수행 업무 (Sent)")
-    if my_reports:
-        for idx, item in enumerate(my_reports, 1):
+    # 기본 포맷 1: 회의록 및 회의 내용
+    lines.append("## 1. 📝 회의록 및 회의 내용")
+    if meeting_items:
+        for idx, item in enumerate(meeting_items, 1):
+            m_info = _extract_meeting_details(item)
+            lines.append(f"### 1-{idx}. {item['subject']}")
+            lines.append(f"- **참여자**: {m_info['participants']}")
+            lines.append(f"- **회의시간**: {m_info['meeting_time']}")
+            lines.append(f"- **회의내용 요약**: {m_info['meeting_summary']}...")
+            lines.append("")
+    else:
+        lines.append("- 당일 회의록 또는 회의 내용 메일 내역이 없습니다.\n")
+
+    # 기본 포맷 2: 기타 문의 대응
+    lines.append("## 2. 💬 기타 문의 및 업무 대응")
+    if inquiry_items:
+        for idx, item in enumerate(inquiry_items, 1):
+            i_info = _extract_inquiry_details(item)
             lines.append(f"### 2-{idx}. {item['subject']}")
-            lines.append(f"- **일시**: {item['mail_date']}")
-            lines.append(f"- **수신자**: {item['receiver']}")
-            lines.append(f"- **판정 방식**: `{item['decided_by']}` ({item['rule_name']})")
-            snippet = item['body_clean'][:200].replace("\n", " ").strip()
-            lines.append(f"- **내용 요약**: {snippet}...")
+            lines.append(f"- **요청자**: {i_info['requester']}")
+            lines.append(f"- **내용 제목 선정**: {i_info['selected_title']}")
+            lines.append(f"- **내용 요약**: {i_info['content_summary']}...")
             lines.append("")
     else:
-        lines.append("- 당일 발신/보고 메일 내역이 없습니다.\n")
-
-    # 수신 요청 및 협업 대응 내역
-    lines.append("## 3. 수신 요청 및 협업 대응 내역 (Received)")
-    if received_requests:
-        for idx, item in enumerate(received_requests, 1):
-            lines.append(f"### 3-{idx}. {item['subject']}")
-            lines.append(f"- **일시**: {item['mail_date']}")
-            lines.append(f"- **발신자**: {item['sender']}")
-            lines.append(f"- **판정 방식**: `{item['decided_by']}` ({item['rule_name']})")
-            snippet = item['body_clean'][:200].replace("\n", " ").strip()
-            lines.append(f"- **내용 요약**: {snippet}...")
-            lines.append("")
-    else:
-        lines.append("- 당일 수신된 요청 메일 내역이 없습니다.\n")
-
-    # 확인 필요 항목 (보수적 원칙에 따른 보존)
-    if uncertain_items:
-        lines.append("## 4. ⚠️ 확인 필요 항목 (UNCERTAIN)")
-        lines.append("> 규칙 미매칭 또는 LLM 판단 불가로 누락 방지를 위해 사람이 직접 검토해야 하는 메일입니다.")
-        for idx, item in enumerate(uncertain_items, 1):
-            lines.append(f"- **[{item['folder_type']}] {item['subject']}**")
-            lines.append(f"  - 발신: {item['sender']} | 일시: {item['mail_date']}")
-            lines.append(f"  - 근거: `{item['evidence']}`")
-        lines.append("")
+        lines.append("- 당일 기타 문의 및 업무 대응 메일 내역이 없습니다.\n")
 
     lines.append("---")
     lines.append(f"*작성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 작성 기준: {MY_EMAIL}*")
 
     report_markdown = "\n".join(lines)
 
-    print(f"[4] 일일 업무 일지 생성 완료 (총 업무 {len(my_reports) + len(received_requests)}건 반영)")
+    print(f"[4] 일일 업무 일지 생성 완료 (총 업무 {len(included_items)}건: 회의록 {len(meeting_items)}건, 문의대응 {len(inquiry_items)}건)")
 
     return {
         "summary": summary,
