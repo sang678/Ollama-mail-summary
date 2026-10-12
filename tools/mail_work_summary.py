@@ -57,7 +57,7 @@ try:
     import config
     CONFIG_FILE_PATH = str(getattr(config, "__file__", "config.py"))
     OLLAMA_HOST = getattr(config, "OLLAMA_HOST", "http://localhost:11434")
-    JUDGE_MODEL = getattr(config, "JUDGE_MODEL", "gemma4:e2b")
+    JUDGE_MODEL = getattr(config, "JUDGE_MODEL", "qwen2.5-coder:7b")
     USE_LLM = getattr(config, "USE_LLM", True)
     MY_EMAIL = getattr(config, "MY_EMAIL", "developer@company.com")
     MAIL_INBOX_DIR = getattr(config, "MAIL_INBOX_DIR", str(PACKAGE_ROOT / "sample_mails" / "inbox"))
@@ -68,7 +68,7 @@ except ImportError as err:
     # config.py를 못 찾거나 임포트 실패 시 상세 원인 출력 (조용한 실패 방지)
     print(f"⚠️ [주의] config.py 임포트 실패 ({err}). 기본 sample_mails 폴백 설정을 사용합니다.")
     OLLAMA_HOST = "http://localhost:11434"
-    JUDGE_MODEL = "gemma4:e2b"
+    JUDGE_MODEL = "qwen2.5-coder:7b"
     USE_LLM = True
     MY_EMAIL = "developer@company.com"
     MAIL_INBOX_DIR = str(PACKAGE_ROOT / "sample_mails" / "inbox")
@@ -103,6 +103,29 @@ class WorkJudgement(BaseModel):
     )
 
 
+class InquirySummary(BaseModel):
+    """기타 문의 및 업무 대응 메일의 LLM 구조화 요약 스키마"""
+    selected_title: str = Field(
+        description="메일의 핵심 업무 목적/안건을 명확하게 나타내는 1줄 제목 (예: '4분기 서비스 배포 일정 및 리소스 점검 요청')"
+    )
+    content_summary: str = Field(
+        description="요청 사항 및 처리/대응 내역을 핵심 위주로 명확하게 작성한 2~3문장 요약"
+    )
+
+
+class MeetingSummary(BaseModel):
+    """회의록 메일의 LLM 구조화 요약 스키마"""
+    participants: str = Field(
+        description="회의 참석자 또는 참여 부서/담당자 (본문 명시된 참석자, 없으면 발신/수신자)"
+    )
+    meeting_time: str = Field(
+        description="회의 진행 일시 및 시간 (예: '2026-10-06 14:00 ~ 15:00')"
+    )
+    meeting_summary: str = Field(
+        description="회의에서 논의된 주요 안건 및 핵심 결정사항 2~3문장 요약"
+    )
+
+
 class EmailItem(TypedDict):
     """개별 파싱된 메일의 표준 데이터 구조"""
     id: str                 # 파일명 또는 메시지 식별자
@@ -120,6 +143,8 @@ class EmailItem(TypedDict):
     decided_by: str         # static | rule | llm | fallback
     rule_name: str          # 적용된 규칙명 또는 모델명
     evidence: str           # 판단 근거 실제 텍스트 조각
+    inquiry_details: Optional[Dict[str, str]]   # LLM 또는 규칙으로 추출된 기타 문의 상세
+    meeting_details: Optional[Dict[str, str]]   # LLM 또는 규칙으로 추출된 회의록 상세
 
 
 class DailyWorkState(TypedDict):
@@ -972,15 +997,18 @@ def node_llm_classify(state: DailyWorkState) -> dict:
                 item["rule_name"] = f"llm_{JUDGE_MODEL}"
                 item["evidence"] = result.reason or "LLM 비업무 판정"
         except Exception as e:
-            # LLM 호출 실패 시 기본 기타 문의 대응으로 편입
+            # LLM 호출 실패 시 콘솔 경고 출력 및 기본 기타 문의 대응으로 편입
+            print(f"   ⚠️ [3-1] LLM 판정 호출 실패 ({item['subject'][:25]}...): {e}")
             item["status"] = "INCLUDED"
             item["category"] = "MY_REPORT" if item["is_my_sent"] else "RECEIVED_REQUEST"
             item["decided_by"] = "fallback"
             item["rule_name"] = "unmatched_inquiry_default"
             item["evidence"] = f"LLM 판정 예외 발생({e}) -> 일반 문의 기본 배정"
             stats["rule_included"] = stats.get("rule_included", 0) + 1
+            stats["llm_failed"] = stats.get("llm_failed", 0) + 1
 
-    print(f"[3] LLM 판정 완료: 성공 {stats.get('llm_evaluated', 0)}건")
+    failed_cnt = stats.get("llm_failed", 0)
+    print(f"[3] LLM 판정 완료: 성공 {stats.get('llm_evaluated', 0)}건" + (f" (실패/폴백 {failed_cnt}건)" if failed_cnt > 0 else ""))
 
     return {
         "parsed_items": items,
@@ -1006,10 +1034,10 @@ def _is_meeting_mail(item: EmailItem) -> bool:
 
 def _extract_meeting_details(item: EmailItem) -> Dict[str, str]:
     """
-    [기본 포맷 1: 회의록 및 회의 내용]
+    [기본 포맷 1: 회의록 메일 메타데이터 파서]
     - 참여자: 본문 내 '참석자/참여자' 또는 발신/수신자 정보
     - 회의시간: 본문 내 '일시/시간' 또는 메일 발신 일시
-    - 회의내용 요약: 안건 및 핵심 결정사항 요약
+    - 회의내용 요약: LLM 요약이 필수 적용되며, 단순 본문 자르기(슬라이싱)는 완전히 배제합니다.
     """
     body = item.get("body_clean", "")
     sender = item.get("sender", "발신자 미상")
@@ -1030,14 +1058,8 @@ def _extract_meeting_details(item: EmailItem) -> Dict[str, str]:
     else:
         meeting_time = mail_date
 
-    # 3. 회의내용 요약
-    clean_summary = body
-    clean_summary = re.sub(r"\[최신 회신 내용\]|\[직전 요청 맥락\]|\[최초 스레드 원문\]", "", clean_summary)
-    clean_summary = clean_summary.replace("\r\n", " ").replace("\n", " ").strip()
-    clean_summary = re.sub(r"[ \t]+", " ", clean_summary)
-    meeting_summary = clean_summary[:350].strip()
-    if not meeting_summary:
-        meeting_summary = item.get("evidence", "회의 내용 공유 및 검토")
+    # 3. 회의내용 요약 (단순 본문 자르기 차단)
+    meeting_summary = item.get("evidence") or "회의 안건 및 결정사항 (LLM 정밀 요약 대상)"
 
     return {
         "participants": participants,
@@ -1059,12 +1081,11 @@ def _clean_subject_title(subject: str) -> str:
 
 def _extract_inquiry_details(item: EmailItem) -> Dict[str, str]:
     """
-    [기본 포맷 2: 기타 문의 대응]
+    [기본 포맷 2: 기타 문의 메일 메타데이터 파서]
     - 요청자: 발신자 (본인 발신 회신의 경우 수신처/의뢰처)
     - 내용 제목 선정: 원제목을 정제한 핵심 업무 제목
-    - 내용 요약: 요청 사항 및 조치/대응 결과 요약
+    - 내용 요약: LLM 요약이 필수 적용되며, 단순 본문 자르기(슬라이싱)는 완전히 배제합니다.
     """
-    body = item.get("body_clean", "")
     sender = item.get("sender", "발신자 미상")
     receiver = item.get("receiver", "수신자 미상")
     subject = item.get("subject", "")
@@ -1078,11 +1099,8 @@ def _extract_inquiry_details(item: EmailItem) -> Dict[str, str]:
     # 2. 내용 제목 선정
     selected_title = _clean_subject_title(subject)
 
-    # 3. 내용 요약
-    clean_summary = body.replace("\n", " ").strip()
-    content_summary = clean_summary[:350].strip()
-    if not content_summary:
-        content_summary = item.get("evidence", "업무 요청 및 문의 대응")
+    # 3. 내용 요약 (단순 본문 자르기 차단)
+    content_summary = item.get("evidence") or "업무 요청 및 문의 대응 (LLM 정밀 요약 대상)"
 
     return {
         "requester": requester,
@@ -1091,9 +1109,159 @@ def _extract_inquiry_details(item: EmailItem) -> Dict[str, str]:
     }
 
 
+def node_llm_summarize(state: DailyWorkState) -> dict:
+    """
+    [4단계 노드] 업무로 확정된 메일(기타 문의 및 회의록)의 제목과 핵심 내용을 LLM으로 정밀 요약합니다.
+    - 기타 문의 대응: 핵심 업무 제목 선정(selected_title) 및 요청/조치 내역(content_summary) 2~3문장 요약
+    - 회의록: 참석자, 회의시간, 핵심 논의/결정사항 요약
+    - 단순 본문 잘라 붙이기(슬라이싱)를 원천 차단하고 LLM의 지능적 요약 결과만을 산출합니다.
+    """
+    use_llm = state.get("use_llm", USE_LLM)
+    items = state["parsed_items"]
+    stats = dict(state.get("rule_stats", {}))
+
+    included_indices = [i for i, x in enumerate(items) if x.get("status") != "EXCLUDED"]
+
+    if not included_indices:
+        print("[4] LLM 업무 내용 요약: 요약 대상 업무 메일이 없어 건너뜁니다.")
+        return {"parsed_items": items, "rule_stats": stats}
+
+    if not use_llm:
+        print(f"[4] ⚠️ LLM 비활성화 상태: 단순 슬라이싱 없이 메타데이터 기반 기본 정보를 배정합니다.")
+        for idx in included_indices:
+            item = items[idx]
+            if _is_meeting_mail(item):
+                item["meeting_details"] = _extract_meeting_details(item)
+            else:
+                item["inquiry_details"] = _extract_inquiry_details(item)
+        return {"parsed_items": items, "rule_stats": stats}
+
+    # ChatOllama 요약기 초기화
+    try:
+        from langchain_ollama import ChatOllama
+        base_llm = ChatOllama(
+            base_url=OLLAMA_HOST,
+            model=JUDGE_MODEL,
+            temperature=0,
+            num_ctx=8192,
+            keep_alive="10m",
+        )
+        inquiry_llm = base_llm.with_structured_output(InquirySummary, method="json_schema")
+        meeting_llm = base_llm.with_structured_output(MeetingSummary, method="json_schema")
+    except Exception as e:
+        print(f" ⚠️ [4] LLM 요약기 초기화 실패 ({e}). 모델 호출 장애 상태를 명시합니다.")
+        for idx in included_indices:
+            item = items[idx]
+            if _is_meeting_mail(item):
+                details = _extract_meeting_details(item)
+                details["meeting_summary"] = f"[⚠️ LLM 초기화 오류로 요약 불가: {e}]"
+                item["meeting_details"] = details
+            else:
+                details = _extract_inquiry_details(item)
+                details["content_summary"] = f"[⚠️ LLM 초기화 오류로 요약 불가: {e}]"
+                item["inquiry_details"] = details
+        return {"parsed_items": items, "rule_stats": stats}
+
+    inquiry_targets = [i for i in included_indices if not _is_meeting_mail(items[i])]
+    meeting_targets = [i for i in included_indices if _is_meeting_mail(items[i])]
+
+    print(f"[4] LLM 업무 내용 요약 시작: 기타 문의 {len(inquiry_targets)}건, 회의록 {len(meeting_targets)}건 ({JUDGE_MODEL} 모델)")
+
+    summarized_count = 0
+    fallback_count = 0
+
+    # 1. 기타 문의 요약 (단순 본문 슬라이싱 완전 배제)
+    for idx in inquiry_targets:
+        item = items[idx]
+        body_snippet = item.get("body_clean", "")[:2500].strip()
+        requester = item.get("sender", "발신자 미상")
+        if item.get("is_my_sent") or item.get("folder_type") == "SENT":
+            requester_desc = f"{item.get('receiver', '수신자')} (수신/의뢰처)"
+        else:
+            requester_desc = requester
+
+        prompt = f"""당신은 사내 업무 이메일을 간결하고 명확하게 정리하는 어시스턴트입니다.
+다음 이메일을 분석하여 업무 일지의 '기타 문의 및 업무 대응' 항목에 적합한 제목과 내용 요약을 작성하세요.
+
+작성 가이드:
+1. selected_title: 접두어([검토 요청], [보고], Re: 등)를 제거하고, 메일의 핵심 목적/주제를 나타내는 명확한 1줄 제목 (예: '4분기 서비스 배포 일정 점검 요청', 'API 서버 캐시 튜닝 완료')
+2. content_summary: '누가 무엇을 요청/문의했고, 어떤 작업/조치가 이루어졌거나 필요한지' 핵심 사실 위주로 2~3문장으로 간결하게 작성
+3. 안부 인사('안녕하세요', '감사합니다' 등)와 서명은 제외하고 핵심만 기술
+
+메일 정보:
+>>> 제목: {item.get('subject', '')}
+>>> 요청자/상대방: {requester_desc}
+>>> 본문:
+{body_snippet}
+"""
+        try:
+            res: InquirySummary = inquiry_llm.invoke(prompt)
+            item["inquiry_details"] = {
+                "requester": requester_desc,
+                "selected_title": res.selected_title.strip() if res.selected_title else _clean_subject_title(item.get("subject", "")),
+                "content_summary": res.content_summary.strip() if res.content_summary else f"[요약 내용 미생성 - {item.get('evidence', '')}]",
+            }
+            summarized_count += 1
+        except Exception as err:
+            print(f"   ⚠️ [4-1] 기타 문의 LLM 요약 실패 ({item.get('subject', '')[:25]}...): {err}")
+            item["inquiry_details"] = {
+                "requester": requester_desc,
+                "selected_title": _clean_subject_title(item.get("subject", "")),
+                "content_summary": f"[⚠️ 요약 생성 실패: 모델 응답 오류 ({err})]",
+            }
+            fallback_count += 1
+
+    # 2. 회의록 요약 (단순 본문 슬라이싱 완전 배제)
+    for idx in meeting_targets:
+        item = items[idx]
+        body_snippet = item.get("body_clean", "")[:2500].strip()
+        fallback_details = _extract_meeting_details(item)
+
+        prompt = f"""당신은 사내 회의록 이메일을 요약하는 어시스턴트입니다.
+다음 이메일을 분석하여 회의 보고서에 들어갈 참여자, 회의시간, 회의내용 요약을 작성하세요.
+
+작성 가이드:
+1. participants: 본문에 명시된 참석자/참여자 목록 (본문에 명시가 없으면 발신/수신자 정보 활용)
+2. meeting_time: 회의 진행 일시 및 시간 (예: '2026-10-06 14:00 ~ 15:00', 없으면 메일 발신일시)
+3. meeting_summary: 회의에서 논의된 주요 안건 및 핵심 결정사항 2~3문장 요약
+
+메일 정보:
+>>> 제목: {item.get('subject', '')}
+>>> 발신자: {item.get('sender', '')}
+>>> 본문:
+{body_snippet}
+"""
+        try:
+            res: MeetingSummary = meeting_llm.invoke(prompt)
+            item["meeting_details"] = {
+                "participants": res.participants.strip() if res.participants else fallback_details["participants"],
+                "meeting_time": res.meeting_time.strip() if res.meeting_time else fallback_details["meeting_time"],
+                "meeting_summary": res.meeting_summary.strip() if res.meeting_summary else f"[회의 요약 미생성 - {item.get('evidence', '')}]",
+            }
+            summarized_count += 1
+        except Exception as err:
+            print(f"   ⚠️ [4-2] 회의록 LLM 요약 실패 ({item.get('subject', '')[:25]}...): {err}")
+            item["meeting_details"] = {
+                "participants": fallback_details["participants"],
+                "meeting_time": fallback_details["meeting_time"],
+                "meeting_summary": f"[⚠️ 회의록 요약 생성 실패: 모델 응답 오류 ({err})]",
+            }
+            fallback_count += 1
+
+    stats["llm_summarized"] = summarized_count
+    stats["summary_fallbacks"] = fallback_count
+    failed_txt = f" (실패 {fallback_count}건)" if fallback_count > 0 else ""
+    print(f"[4] LLM 업무 내용 요약 완료: 성공 {summarized_count}건{failed_txt}")
+
+    return {
+        "parsed_items": items,
+        "rule_stats": stats,
+    }
+
+
 def node_aggregate_and_report(state: DailyWorkState) -> dict:
     """
-    [4단계 노드] 분류 결과를 집계하고 구조화된 Markdown 보고서를 생성합니다.
+    [5단계 노드] 분류 및 요약 결과를 집계하고 구조화된 Markdown 보고서를 생성합니다.
     사용자 지정 기본 포맷(옵션 A):
     1. 회의록 및 회의 내용 (참여자, 회의시간, 회의내용 요약)
     2. 기타 문의 대응 (요청자, 내용 제목 선정, 내용 요약)
@@ -1135,10 +1303,10 @@ def node_aggregate_and_report(state: DailyWorkState) -> dict:
         lines.append("- 해당 일자에 추출된 업무 메일이 없습니다.")
     else:
         for item in meeting_items:
-            m_info = _extract_meeting_details(item)
+            m_info = item.get("meeting_details") or _extract_meeting_details(item)
             lines.append(f"- **[회의]** {item['subject']} (시간: {m_info['meeting_time']})")
         for item in inquiry_items:
-            i_info = _extract_inquiry_details(item)
+            i_info = item.get("inquiry_details") or _extract_inquiry_details(item)
             lines.append(f"- **[문의/대응]** {i_info['selected_title']} (요청: {i_info['requester']})")
     lines.append("")
 
@@ -1146,11 +1314,11 @@ def node_aggregate_and_report(state: DailyWorkState) -> dict:
     lines.append("## 1. 📝 회의록 및 회의 내용")
     if meeting_items:
         for idx, item in enumerate(meeting_items, 1):
-            m_info = _extract_meeting_details(item)
+            m_info = item.get("meeting_details") or _extract_meeting_details(item)
             lines.append(f"### 1-{idx}. {item['subject']}")
             lines.append(f"- **참여자**: {m_info['participants']}")
             lines.append(f"- **회의시간**: {m_info['meeting_time']}")
-            lines.append(f"- **회의내용 요약**: {m_info['meeting_summary']}...")
+            lines.append(f"- **회의내용 요약**: {m_info['meeting_summary']}")
             lines.append("")
     else:
         lines.append("- 당일 회의록 또는 회의 내용 메일 내역이 없습니다.\n")
@@ -1159,11 +1327,11 @@ def node_aggregate_and_report(state: DailyWorkState) -> dict:
     lines.append("## 2. 💬 기타 문의 및 업무 대응")
     if inquiry_items:
         for idx, item in enumerate(inquiry_items, 1):
-            i_info = _extract_inquiry_details(item)
+            i_info = item.get("inquiry_details") or _extract_inquiry_details(item)
             lines.append(f"### 2-{idx}. {item['subject']}")
             lines.append(f"- **요청자**: {i_info['requester']}")
             lines.append(f"- **내용 제목 선정**: {i_info['selected_title']}")
-            lines.append(f"- **내용 요약**: {i_info['content_summary']}...")
+            lines.append(f"- **내용 요약**: {i_info['content_summary']}")
             lines.append("")
     else:
         lines.append("- 당일 기타 문의 및 업무 대응 메일 내역이 없습니다.\n")
@@ -1173,7 +1341,7 @@ def node_aggregate_and_report(state: DailyWorkState) -> dict:
 
     report_markdown = "\n".join(lines)
 
-    print(f"[4] 일일 업무 일지 생성 완료 (총 업무 {len(included_items)}건: 회의록 {len(meeting_items)}건, 문의대응 {len(inquiry_items)}건)")
+    print(f"[5] 일일 업무 일지 생성 완료 (총 업무 {len(included_items)}건: 회의록 {len(meeting_items)}건, 문의대응 {len(inquiry_items)}건)")
 
     return {
         "summary": summary,
@@ -1192,12 +1360,14 @@ def build_mail_summary_graph():
     g.add_node("scan_and_parse", node_scan_and_parse_mht)
     g.add_node("rule_filter", node_rule_filter)
     g.add_node("llm_classify", node_llm_classify)
+    g.add_node("llm_summarize", node_llm_summarize)
     g.add_node("aggregate_and_report", node_aggregate_and_report)
 
     g.add_edge(START, "scan_and_parse")
     g.add_edge("scan_and_parse", "rule_filter")
     g.add_edge("rule_filter", "llm_classify")
-    g.add_edge("llm_classify", "aggregate_and_report")
+    g.add_edge("llm_classify", "llm_summarize")
+    g.add_edge("llm_summarize", "aggregate_and_report")
     g.add_edge("aggregate_and_report", END)
 
     return g.compile()

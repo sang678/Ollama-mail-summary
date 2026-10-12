@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Ollama 로컬 LLM 설정 (폐쇄망 사내망 환경)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "gemma4:e2b")
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "qwen2.5-coder:7b")
 USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
 
 # 사용자 식별용 이메일 (발신/수신 식별 및 업무 분류용)
